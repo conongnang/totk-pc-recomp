@@ -12,7 +12,8 @@
 # realtime = 1
 # Cloth simulation on the real-time clock. Needs realtime = 1.
 # cloth_realtime = 1
-# Fix for physics that bounce at high frame rates.
+# Fix for physics that bounce at high frame rates, and on 1.4.3 for objects that stay see-through or invisible above
+# 60 fps (their fade-in stops).
 # highfps_fix = 1
 
 [performance]
