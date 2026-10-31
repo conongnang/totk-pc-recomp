@@ -1,8 +1,9 @@
 # Builds the installer release of docs/installer.md and publishes it on GitHub Releases.
 #
-# A pushed tag v<VERSION> builds and publishes. Run by hand on a branch, it only builds: the zip stays on the run as an
-# artifact for a week. The release holds no game data and no totk.exe, which the installer builds on the player's
-# machine; tools/make_release.py checks the folder before it packs it.
+# A pushed tag v<VERSION>, or v<VERSION>-<suffix> for a build that is not plain VERSION (v0.1.9-cheats), builds and
+# publishes. Run by hand on a branch, it only builds: the zip stays on the run as an artifact for a week. The release
+# holds no game data and no totk.exe, which the installer builds on the player's machine; tools/make_release.py checks
+# the folder before it packs it.
 #
 # Everything a runner needs beyond the repository's tools stays in this file, so a fork carries no other change and
 # keeps syncing with upstream.
@@ -34,9 +35,14 @@ jobs:
         id: version
         run: |
           version=$(cat VERSION)
-          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match VERSION $version"
-            exit 1
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            case "$GITHUB_REF_NAME" in
+              "v$version" | "v$version"-*) version=${GITHUB_REF_NAME#v} ;;
+              *)
+                echo "::error::tag $GITHUB_REF_NAME does not match VERSION $version"
+                exit 1
+                ;;
+            esac
           fi
           echo "name=TotK-Setup-$version-windows" >> "$GITHUB_OUTPUT"
 
@@ -102,6 +108,7 @@ jobs:
 
       # The runner has no Vulkan device, so make_release.py's bundle check stops at the installer's Vulkan check instead
       # of at the missing game files. That stop is accepted here: the toolchain has by then built and run hostcheck.
+      # The cheats branch's installer runs tools/cheats.py at the lift step, which make_release.py's list leaves out.
       - name: Assemble the release
         shell: python
         env:
@@ -122,7 +129,9 @@ jobs:
                   print(str(e).splitlines()[0])
 
           make_release.check_bundle = check_bundle_no_gpu
-          sys.argv = ['make_release.py', '--out', 'build/release/TotK-Setup', '--zip', os.environ['ZIP']]
+          if os.path.isfile('tools/cheats.py') and 'cheats.py' not in make_release.TOOLS_FILES:
+              make_release.TOOLS_FILES.append('cheats.py')
+          sys.argv =['make_release.py', '--out', 'build/release/TotK-Setup', '--zip', os.environ['ZIP']]
           make_release.main()
 
       # make_release.py's own run of this stops with the Vulkan check above.
