@@ -1,0 +1,159 @@
+# Builds the installer release of docs/installer.md and publishes it on GitHub Releases.
+#
+# A pushed tag v<VERSION> builds and publishes. Run by hand on a branch, it only builds: the zip stays on the run as an
+# artifact for a week. The release holds no game data and no totk.exe, which the installer builds on the player's
+# machine; tools/make_release.py checks the folder before it packs it.
+#
+# Everything a runner needs beyond the repository's tools stays in this file, so a fork carries no other change and
+# keeps syncing with upstream.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      name: ${{ steps.version.outputs.name }}
+    steps:
+      # Git for Windows defaults to true, which breaks tools/build_hactool.py's patches on the upstream checkout.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v7
+
+      - name: Name the release after VERSION
+        id: version
+        run: |
+          version=$(cat VERSION)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION $version"
+            exit 1
+          fi
+          echo "name=TotK-Setup-$version-windows" >> "$GITHUB_OUTPUT"
+
+      - uses: astral-sh/setup-uv@v10.3.3
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+      # tools/build_hactool.py runs the runner image's C:\msys64, so this adds to it and installs no second copy.
+      - uses: msys2/setup-msys2@v2
+        with:
+          release: false
+          msystem: UCRT64
+          update: true
+          install: make mingw-w64-ucrt-x86_64-gcc
+
+      - name: Python environment
+        run: |
+          uv venv --python 3.14 .venv-py314
+          uv pip install --python .venv-py314/Scripts/python.exe -r tools/requirements-py314.txt
+          echo "$(pwd -W)/.venv-py314/Scripts" >> "$GITHUB_PATH"
+
+      # tools/fetch_refs.sh clones with --depth 1, but tools/shader_list.py reads the whole history of the shader list.
+      - name: Fetch MacNativeGames with its history
+        run: |
+          read -r url pin < <(awk '$2 == "MacNativeGames" { print $3, $4 }' tools/fetch_refs.sh)
+          git init -q refs/MacNativeGames
+          git -C refs/MacNativeGames remote add origin "$url"
+          git -C refs/MacNativeGames fetch -q origin "$pin"
+          git -C refs/MacNativeGames checkout -q FETCH_HEAD
+
+      - name: Restore the pinned downloads
+        uses: actions/cache@v6
+        with:
+          path: toolchain/release-dl
+          key: release-dl-${{ hashFiles('tools/make_release.py') }}
+          restore-keys: release-dl-
+
+      - name: Build the shader translator
+        run: python tools/build_xlate.py
+      - name: Build hactool
+        run: python tools/build_hactool.py
+
+      # build_game.py --make-runtime-lib wants generated/v121 to exist, and the runner has no game to lift. The library
+      # takes only MOD_COUNT and MOD_MAIN_BASE from layout.h: the module set is the same on every supported update, main
+      # always sits at FIRST_BASE, and the player's bases and sizes reach the runtime through modules.c at install time.
+      # So these zero sizes and empty module folders change nothing in the library.
+      - name: Stand in for the generated C
+        shell: python
+        run: |
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, 'recomp')
+          import layout
+
+          gen = Path('generated/v121')
+          hashes = json.loads(Path('tools/data/expected-v1.2.1.json').read_text(encoding='utf-8'))['exefs_sha256']
+          mods = [n for n in layout.ORDER if n in hashes]
+          layout.write([(n, layout.FIRST_BASE, 0) for n in mods], gen)
+          for n in mods:
+              (gen / n).mkdir()
+              (gen / n / 'manifest.json').write_text('[]\n')
+              (gen / n / f'{n}_table.c').write_text('')
+
+      # The runner has no Vulkan device, so make_release.py's bundle check stops at the installer's Vulkan check instead
+      # of at the missing game files. That stop is accepted here: the toolchain has by then built and run hostcheck.
+      - name: Assemble the release
+        shell: python
+        env:
+          ZIP: build/release/${{ steps.version.outputs.name }}.zip
+        run: |
+          import os, sys
+          sys.path.insert(0, 'tools')
+          import make_release
+
+          check_bundle = make_release.check_bundle
+
+          def check_bundle_no_gpu(out):
+              try:
+                  check_bundle(out)
+              except SystemExit as e:
+                  if "errors ['check.vulkan_" not in str(e):
+                      raise
+                  print(str(e).splitlines()[0])
+
+          make_release.check_bundle = check_bundle_no_gpu
+          sys.argv = ['make_release.py', '--out', 'build/release/TotK-Setup', '--zip', os.environ['ZIP']]
+          make_release.main()
+
+      # make_release.py's own run of this stops with the Vulkan check above.
+      - name: Check the installer window
+        working-directory: build/release/TotK-Setup
+        run: python/python.exe -m installer.gui --selftest
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.version.outputs.name }}
+          path: build/release/${{ steps.version.outputs.name }}.zip
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.name }}
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" ./*.zip
+          --repo "$GITHUB_REPOSITORY"
+          --title "$GITHUB_REF_NAME"
+          --generate-notes
+          --verify-tag
