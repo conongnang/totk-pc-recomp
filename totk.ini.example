@@ -118,6 +118,11 @@
 # 3D render scale: the scene's size relative to the game resolution, game (5/6, the game's own 1600x900 at 1080p) or
 # a percentage (25 to 400, at most 4096 pixels a side); above 100 supersamples the scene (anti-aliasing). Read at start.
 # render_scale = game
+# Sharper sun shadows: the shadow map at 1 (the game's own 400x400), 2 to 8 times its size on each side, so 4 is
+# 1600x1600 and 8 is 3200x3200. The game raises the map to 800 or 872 by itself in some scenes, so 8 can reach 6976x6976
+# (about 500 MiB of GPU memory, against 8 MiB). The shadows keep their soft edge and lose
+# their blocks. Costs GPU time in scenes with many shadow casters. Read at start.
+# shadow_scale = 1
 # Scaling to the window when it is larger than the game resolution: fsr (AMD FSR 1) or bilinear, and FSR's sharpening
 # from 0 (off) to 100. Changes while the game runs take effect at once.
 # upscaler = fsr

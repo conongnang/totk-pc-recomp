@@ -273,6 +273,23 @@ static void init_image(Tex *e, VkCommandBuffer cb) {
     }
 }
 
+// TOTK_SHADOW_SCALE (1 to 8, default 1, read at start): image texels per guest texel of the sun's shadow map, the game's
+// D16 arrays. In the world the game renders four 400x400 layers on every output (2-layer arrays of 720x720 and 1440x1440
+// exist at the same address, seen rendered only on the title screen), and that size comes from no setting of the
+// game's, so the image alone grows: the guest keeps its storage, its viewports are scaled in the replay (record_fixed,
+// vk_exec_scissor), and shaders sample it in normalized coordinates. Their filter offsets stay in guest texels, so a
+// shadow's soft edge keeps its width in the world and loses its blocks.
+static uint32_t shadow_scale(const nvn_texdesc *d, uint32_t layers) {
+    static int scale;
+    if (!scale) {
+        const char *e = cfg_get("TOTK_SHADOW_SCALE");
+        int s = e ? atoi(e) : 1;
+        scale = s < 1 ? 1 : s > 8 ? 8 : s;
+    }
+    return scale > 1 && d->format == NVN_FORMAT_DEPTH16 && d->target == NVN_TEXTURE_TARGET_2D_ARRAY && layers >= 2 &&
+           d->width == d->height && d->samples <= 1 ? (uint32_t)scale : 1;
+}
+
 // defer_init: the caller records the image's first transition (init_image or alias_copy).
 static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     static volatile long n_unmapped, n_unsupported, n_failed, n_unbound;
@@ -300,6 +317,10 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     case NVN_TEXTURE_TARGET_CUBEMAP: case NVN_TEXTURE_TARGET_CUBEMAP_ARRAY: layers = L.layers; break;
     default: break;
     }
+    uint32_t scale = shadow_scale(d, layers);
+    if (scale > 1) rt_log("vk: shadow map %ux%u x %u layers at %#llx: image %ux%u", w, h, layers,
+                          (unsigned long long)k->addr, w * scale, h * scale);
+    w *= scale, h *= scale;
     uint32_t levels = umax(d->levels, 1), most = 1;
     for (uint32_t s = umax(umax(w, h), depth); s > 1; s >>= 1) most++;
     if (levels > most) levels = most;
@@ -359,7 +380,8 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     e->f = f;
     e->pub.addr = k->addr;
     VkImage img = VK_NULL_HANDLE;
-    if (nvn_gpu_only(k->addr)) {   // storage in a physical or virtual pool: alias the pool memory (section 3.2)
+    // Storage in a physical or virtual pool: alias the pool memory (section 3.2). A scaled image outgrows that storage.
+    if (scale == 1 && nvn_gpu_only(k->addr)) {
         if (vkCreateImage(c->device, &ci, NULL, &img) == VK_SUCCESS && !bind_pool_memory(c, e, img)) {
             vkDestroyImage(c->device, img, NULL);
             img = VK_NULL_HANDLE;
@@ -399,6 +421,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         p->swz[3] = NVN_TEXTURE_SWIZZLE_A;
     p->mirrored = (uint8_t)tex_mirrored(t);
     p->bound = e->bound_to != NULL;
+    p->scale = (uint8_t)scale;
     p->block_views = (uint8_t)block_views;
     p->fb_usage = (uint8_t)fb_usage;
 

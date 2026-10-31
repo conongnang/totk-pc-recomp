@@ -52,6 +52,7 @@ typedef struct VkExec {
     int rt_resolved;                   // color[] and depth hold this command buffer's images for rt
     VkExecTarget color[8], depth;        // resolved targets
     uint32_t pass_w, pass_h, pass_layers;            // render area and layer count of the open (or next) pass
+    uint32_t pass_scale;                             // image texels per guest texel of the depth target, 1 but for shadow maps
     int pass_noatt;                                   // the pass has no attachment: its size follows the draws (vk_exec_noatt_dims)
     VkFormat pass_color[8], pass_depth, pass_stencil; // attachment formats of the pass (VkPipelineRenderingCreateInfo);
                                                       // VK_FORMAT_UNDEFINED: none

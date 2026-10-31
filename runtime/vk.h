@@ -283,6 +283,7 @@ typedef struct {
     uint8_t chan[4];               // TexVkFormat.chan: component order of a stand-in format, applied by the view swizzle
     uint8_t mirrored, gpu_owned;
     uint8_t bound;                 // aliases physical-pool memory (physical and virtual pools)
+    uint8_t scale;                 // above 1: this many image texels per guest texel (width and height hold the image's size)
     uint8_t block_views;           // BC image that renders through uncompressed views of its blocks (BLOCK_TEXEL_VIEW_
                                    // COMPATIBLE + EXTENDED_USAGE: only those views may use COLOR_ATTACHMENT)
     uint8_t swz[4];               // NVN texture swizzle selectors (nvnTextureBuilderSetSwizzle); a view swizzle replaces them

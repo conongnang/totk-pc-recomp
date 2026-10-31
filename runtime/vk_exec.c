@@ -413,6 +413,7 @@ static void resolve_rt(VkExec *ex) {
                              ex->vp[0][1], ex->vp[0][2], ex->vp[0][3]);
     }
     ex->pass_w = w, ex->pass_h = h, ex->pass_layers = layers;
+    ex->pass_scale = d->image && d->img && d->img->scale > 1 ? d->img->scale : 1;
     ex->pass_ncolor = (uint32_t)n;
     ex->pass_samples = samples ? samples : 1;
     ex->pipe.samples = (uint8_t)ex->pass_samples;
@@ -667,8 +668,9 @@ VkBuffer vk_exec_inline_buffer(VkDeviceSize size) {
 VkRect2D vk_exec_scissor(const VkExec *ex) {
     int64_t w = ex->pass_w, h = ex->pass_h;
     if (!ex->has_scissor) return (VkRect2D){{0, 0}, {(uint32_t)w, (uint32_t)h}};
-    int64_t x0 = ex->scissor.x, y0 = ex->scissor.y;
-    int64_t x1 = x0 + ex->scissor.w, y1 = y0 + ex->scissor.h;
+    int64_t s = ex->pass_scale;   // the guest's scissor is in guest texels
+    int64_t x0 = ex->scissor.x * s, y0 = ex->scissor.y * s;
+    int64_t x1 = x0 + ex->scissor.w * s, y1 = y0 + ex->scissor.h * s;
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > w) x1 = w;
