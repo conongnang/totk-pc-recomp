@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -95,8 +96,34 @@ def kill_tree(proc):
         return
     if os.name == 'nt':
         subprocess.run(['taskkill', '/T', '/F', '/PID', str(proc.pid)], capture_output=True)
-    else:
+        return
+    try:   # run_tool starts each tool in a session of its own: the group holds ninja, clang and the game
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
         proc.kill()
+
+
+def linux_glibc():
+    """(major, minor) of the C library this Linux process runs on, None elsewhere or when it is not glibc."""
+    try:
+        name = os.confstr('CS_GNU_LIBC_VERSION') if sys.platform.startswith('linux') else None
+    except (ValueError, OSError):
+        return None
+    m = re.match(r'glibc (\d+)\.(\d+)', name or '')
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+# The bundled clang, lld and the cryptography wheel are built against glibc 2.34 (tools/make_release_linux.py
+# GLIBC_FLOOR); on an older one they cannot start
+GLIBC_NEEDED = (2, 34)
+
+
+def linux_kernel():
+    """(major, minor) of the running Linux kernel, None elsewhere."""
+    if not sys.platform.startswith('linux'):
+        return None
+    m = re.match(r'(\d+)\.(\d+)', os.uname().release)
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 
 def run_tool(ctx, step, script, args, parse=None, cwd=None):
@@ -110,7 +137,8 @@ def run_tool(ctx, step, script, args, parse=None, cwd=None):
     env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
     with open(log, 'w', encoding='utf-8', newline='\n') as out:
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=cwd or ctx.layout.root,
-                                env=env, text=True, encoding='utf-8', errors='replace', bufsize=1)
+                                env=env, text=True, encoding='utf-8', errors='replace', bufsize=1,
+                                start_new_session=os.name != 'nt')
         try:
             for line in proc.stdout:
                 out.write(line)
@@ -140,9 +168,9 @@ def raise_if_damaged(error, name, path):
 
 
 def game_version(ctx):
-    """The update this install is built from: what the check identified, else the recorded one (an install made before
-    1.4.3 support records none: 1.2.1)."""
-    return ctx.state.get('version', SUPPORTED[0])
+    """The update this install is built from: what the check identified, else the recorded one. An install made before
+    1.4.3 support records no version, and that install is 1.2.1: name it here rather than leaning on SUPPORTED's order."""
+    return ctx.state.get('version', '1.2.1')
 
 
 def expected_update(ctx):
@@ -202,7 +230,8 @@ class Check(Step):
             raise InstallError('check.release_incomplete', paths=missing[:5])
         if dest.exists() and not dest.is_dir():
             raise InstallError('check.dest_not_folder', path=str(dest))
-        if ctx.mode == 'install' and dest.is_dir() and any(dest.iterdir()):
+        own = (ctx.temp, *ctx.temp.parents)   # a temp folder inside the install folder (installer/cli.py) is ours
+        if ctx.mode == 'install' and dest.is_dir() and any(p not in own for p in dest.iterdir()):
             raise InstallError('check.dest_not_empty', path=str(dest))
         lang = ini.canonical_language(ctx.options.lang or ctx.state.get('lang'))
         if not lang:
@@ -230,9 +259,17 @@ class Check(Step):
 
     def host(self, ctx):
         layout, work = ctx.layout, ctx.temp / 'check'
+        glibc = linux_glibc()
+        if glibc and glibc < GLIBC_NEEDED and not layout.dev:
+            raise InstallError('check.glibc_old', version='.'.join(map(str, glibc)),
+                               need='.'.join(map(str, GLIBC_NEEDED)))
         work.mkdir(parents=True, exist_ok=True)
         exe = work / ('hostcheck' + EXE)
-        command = [str(layout.clang), '-O1', str(HOSTCHECK), '-I', str(layout.deps / 'include'), '-o', str(exe)]
+        command = [str(layout.clang), '-O1', str(HOSTCHECK), '-o', str(exe)]
+        if layout.deps:
+            command += ['-I', str(layout.deps / 'include')]
+        if layout.sysroot:
+            command += [f'--sysroot={layout.sysroot}', '-fuse-ld=lld']
         if os.name != 'nt':
             command.append('-ldl')
         r = subprocess.run(command, capture_output=True, text=True, errors='replace')
@@ -255,6 +292,11 @@ class Check(Step):
         if not any(tuple(d['api'][:2]) >= (1, 3) for d in devices):
             raise InstallError('check.vulkan_too_old',
                                devices=', '.join(f'{d["name"]} ({d["api"][0]}.{d["api"][1]})' for d in devices))
+        kernel = linux_kernel()
+        if kernel and kernel < (6, 7):
+            # Without userfaultfd's asynchronous write protection nothing tracks the CPU's writes: the game copies whole
+            # pools to the GPU at each submit and its texture checks see every page as changed (docs/building.md, Linux)
+            ctx.reporter.warning('warn.kernel_old', version='.'.join(map(str, kernel)))
         ctx.host = host
 
     def inputs(self, ctx):
@@ -491,6 +533,22 @@ EMITTED = re.compile(r'^emitted (\d+)/(\d+) chunks')
 DISCOVERED = re.compile(r'^(\w+): \d+ functions \(.*discovery')
 
 
+def bundled_cheats(ctx):
+    """The folder of cheat files the release carries, one per update, tools/data/cheats/<build id>.txt."""
+    return ctx.layout.tools / 'data' / 'cheats'
+
+
+def cheat_files(ctx):
+    """The Atmosphere cheat files in <dest>/cheats, for the lift key. All of them: the one the build reads goes by the
+    build id of the installed main, and the keys are computed before Extract runs (runner plan), when a fresh install
+    has no main and an update may still have another version's. The .status files beside them are lift's own output.
+    A file the same as the bundled one of its name is left out, or installing it would change the key of the next run:
+    the key covers the bundled folder anyway."""
+    bundled = bundled_cheats(ctx)
+    return [f for f in sorted((ctx.dest / 'cheats').glob('*.txt'))
+            if not (bundled / f.name).is_file() or f.read_bytes() != (bundled / f.name).read_bytes()]
+
+
 def cheats_file(ctx):
     """<dest>/cheats/<build id>.txt, the Atmosphere cheat file of the installed main (tools/cheats.py), whether or not
     it exists."""
@@ -508,7 +566,7 @@ class Lift(Step):
 
     def key(self, ctx):
         return fingerprint('lift-2', ctx.keys['extract'], ctx.layout.recomp, ctx.layout.patches(game_version(ctx)),
-                           ctx.layout.tools / 'cheats.py', cheats_file(ctx))
+                           ctx.layout.tools / 'cheats.py', bundled_cheats(ctx), *cheat_files(ctx))
 
     def current(self, ctx, record):
         gen = ctx.temp / 'gen'
@@ -526,20 +584,32 @@ class Lift(Step):
                 rep.progress('lift', 'emit', int(m.group(1)), int(m.group(2)), 'chunks')
 
         # The code cheats of the cheat file become patch sets (tools/cheats.py); its status file tells the runtime
-        # which cheats the build has.
-        patches, cheats = layout.patches(game_version(ctx)), cheats_file(ctx)
+        # which cheats the build has. A player's own file wins over the bundled one, which is installed when there is
+        # none. The player did not choose a bundled file, so one the tools refuse costs its cheats, not the install.
+        plain, cheats = layout.patches(game_version(ctx)), cheats_file(ctx)
+        patches, skipped, bundled = plain, None, bundled_cheats(ctx) / cheats.name
+        ours = bundled.is_file() and (not cheats.is_file() or cheats.read_bytes() == bundled.read_bytes())
+        if ours and not cheats.is_file():
+            cheats.parent.mkdir(exist_ok=True)
+            shutil.copyfile(bundled, cheats)
         if cheats.is_file():
             combined = ctx.temp / 'patches-cheats.txt'
             code, log = run_tool(ctx, 'lift', layout.tools / 'cheats.py',
                                  ['--exefs', ctx.dest / 'exefs', '--cheats', cheats, '--patches', patches,
                                   '--out', combined, '--status', cheats.with_suffix('.status')])
-            if code:
+            if code and not ours:
                 raise InstallError('lift.failed', code=code, log=str(log))
-            patches = combined
-        code, log = run_tool(ctx, 'lift', layout.recomp / 'gen.py',
-                             ['--exefs', ctx.dest / 'exefs', '--out', gen, '--patches', patches], parse)
+            patches, skipped = (plain, log) if code else (combined, None)
+        args = ['--exefs', ctx.dest / 'exefs', '--out', gen]
+        code, log = run_tool(ctx, 'lift', layout.recomp / 'gen.py', args + ['--patches', patches], parse)
+        if code and ours and patches != plain:
+            skipped = log
+            remove(gen)
+            code, log = run_tool(ctx, 'lift', layout.recomp / 'gen.py', args + ['--patches', plain], parse)
         if code:
             raise InstallError('lift.failed', code=code, log=str(log))
+        if skipped:
+            rep.warning('warn.cheats_skipped', log=str(skipped))
         (gen / STAMP).write_text(ctx.keys['lift'] + '\n')
         return {}
 
@@ -556,8 +626,8 @@ class Compile(Step):
         layout = ctx.layout
         clang = subprocess.run([str(layout.clang), '--version'], capture_output=True, text=True).stdout
         tools = [layout.tools / n for n in ('build_game.py', 'romfs_index.py', 'check_content.py')]
-        return fingerprint('compile-1', ctx.keys['lift'], layout.runtime, layout.runtime_lib, layout.deps, *tools,
-                           clang, *[d.name for d in layout.dlls])
+        return fingerprint('compile-1', ctx.keys['lift'], layout.runtime, layout.runtime_lib, layout.deps or 'system',
+                           layout.sysroot or 'host', *tools, clang, *[d.name for d in layout.dlls])
 
     def current(self, ctx, record):
         exe = ctx.dest / ('totk' + EXE)
@@ -582,7 +652,8 @@ class Compile(Step):
 
         rep.progress('compile', 'compile', force=True)
         code, log = run_tool(ctx, 'compile', layout.tools / 'build_game.py', [
-            '--gen', ctx.temp / 'gen', '--out', build, '--toolchain', layout.llvm, '--deps', layout.deps,
+            '--gen', ctx.temp / 'gen', '--out', build, '--toolchain', layout.llvm,
+            *(['--deps', layout.deps] if layout.deps else []), *(['--sysroot', layout.sysroot] if layout.sysroot else []),
             '--runtime', layout.runtime, '--runtime-lib', layout.runtime_lib, '--ninja', layout.ninja,
             '--version', version_tag(game_version(ctx)), '--expected', layout.expected(game_version(ctx)),
             '--exefs', dest / 'exefs', '--romfs', dest / 'romfs',
@@ -605,7 +676,10 @@ class Compile(Step):
 TRANSLATED = re.compile(r'gfx_shader: prepare: (\d+) of (\d+) pairs')
 
 
-WIDE_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160')   # runtime/ui/menu.cpp row_output_res
+# The game resolutions of another shape than 16:9 that runtime/ui/menu.cpp row_output_res lists: 21:9 and 32:9 monitors,
+# and 16:10 screens (the Steam Deck's 1280x800, handhelds and laptops)
+ASPECT_SIZES = ('2560x1080', '3440x1440', '3840x1600', '5120x2160', '3840x1080', '5120x1440',
+                '1280x800', '1680x1050', '1920x1200', '2560x1600')
 
 
 class Prepare(Step):
@@ -645,15 +719,13 @@ class Prepare(Step):
                               dest / 'romfs-patches'])
         if code:
             raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))
-        # The same overlay with the UI laid out for the 21:9 game resolutions the settings menu offers (runtime/romfs.c
-        # overlay_init picks the one that matches). Only 1.4.3 has the camera aspect patch (recomp/patches-v143.txt) the
-        # layouts go with, and ultrawide_layout.py is checked against 1.4.3's layout archive: 1.2.1 builds none.
-        for size in WIDE_SIZES:
+        # The same overlay with the UI laid out for each game resolution of another shape the settings menu offers
+        # (runtime/romfs.c overlay_init picks the one that matches; the camera's side is the patch set aspect,
+        # recomp/patches-v<ver>.txt).
+        for size in ASPECT_SIZES:
             remove(dest / f'romfs-patches-{size}')
-            if version_tag(game_version(ctx)) != 'v143':
-                continue
             code, log = run_tool(ctx, 'prepare', layout.tools / 'make_romfs_patches.py',
-                                 ['--version', 'v143', '--romfs', dest / 'romfs', '--out',
+                                 ['--version', version_tag(game_version(ctx)), '--romfs', dest / 'romfs', '--out',
                                   dest / f'romfs-patches-{size}', '--aspect', size])
             if code:
                 raise InstallError('prepare.romfs_patches_failed', code=code, log=str(log))
